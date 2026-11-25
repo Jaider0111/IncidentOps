@@ -51,6 +51,12 @@ class IncidentRepository:
             )
             """
         )
+        cursor.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_incidents_component_status
+            ON incidents (component, status)
+            """
+        )
         for rule in SLA_POLICY_TABLE.values():
             cursor.execute(
                 """
@@ -107,31 +113,27 @@ class IncidentRepository:
     def get_active_incidents_summary(
         self, component_filter: str, reference_time: datetime
     ) -> List[Dict[str, Any]]:
-        """Obtiene el resumen de incidentes activos para un componente específico.
-
-        ANTI-PATRÓN INTENCIONAL (Para diagnosticar y refactorizar en la Fase 2):
-        - Trae las 10,000 filas con `SELECT * FROM incidents` y filtra en Python.
-        - Por cada fila coincidente, ejecuta un `SELECT` separado a `sla_policies` (N+1).
-        """
+        """Obtiene el resumen SLA de los incidentes activos de un componente."""
         cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM incidents")
-        all_rows = cursor.fetchall()
+        cursor.execute(
+            """
+            SELECT
+                incident_id,
+                title,
+                component,
+                severity,
+                status,
+                created_at,
+                resolved_at
+            FROM incidents
+            WHERE component = ?
+              AND status IN (?, ?)
+            """,
+            (component_filter, "OPEN", "IN_PROGRESS"),
+        )
 
         results: List[Dict[str, Any]] = []
-        for row in all_rows:
-            if row["status"] not in ("OPEN", "IN_PROGRESS"):
-                continue
-            if row["component"] != component_filter:
-                continue
-
-            # Consulta N+1 innecesaria dentro del bucle
-            policy_cursor = self.conn.cursor()
-            policy_cursor.execute(
-                "SELECT max_resolution_minutes FROM sla_policies WHERE severity = ?",
-                (row["severity"],),
-            )
-            _ = policy_cursor.fetchone()
-
+        for row in cursor:
             incident = Incident(
                 incident_id=row["incident_id"],
                 title=row["title"],
@@ -140,7 +142,9 @@ class IncidentRepository:
                 status=row["status"],
                 created_at=datetime.fromisoformat(row["created_at"]),
                 resolved_at=(
-                    datetime.fromisoformat(row["resolved_at"]) if row["resolved_at"] else None
+                    datetime.fromisoformat(row["resolved_at"])
+                    if row["resolved_at"]
+                    else None
                 ),
             )
             sla_eval = evaluate_sla_status(incident, reference_time=reference_time)
